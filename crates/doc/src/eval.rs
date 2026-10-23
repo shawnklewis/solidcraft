@@ -1023,6 +1023,11 @@ pub struct FeatureResult {
     pub stale: bool,
     #[serde(skip)]
     fingerprint: u64,
+    /// Taken from a saved model that did not keep this feature's state (#3220): `state` only
+    /// stands in for it until [`Model::evaluate`] evaluates the feature again, which
+    /// [`Model::adopt`] does before the model is used.
+    #[serde(skip)]
+    unkept: bool,
     #[serde(skip)]
     pub state: Arc<ModelState>,
 }
@@ -1792,11 +1797,13 @@ impl Model {
             let cancelled = watched.step(i);
             let fp = chain_fingerprint(doc, &vals, f, prev_fp, rolled_back, &self.step_digests, Some(&state));
             prev_fp = fp;
+            let current = |old: &&FeatureResult| old.id == f.id && old.fingerprint == fp && !old.stale;
+            // A state the saved model did not keep is evaluated again from the one before it; the
+            // results after it that the model did keep still stand (#3220).
+            let unkept = reuse && self.results.get(i).filter(current).is_some_and(|old| old.unkept);
             if reuse
-                && let Some(old) = self.results.get(i)
-                && old.id == f.id
-                && old.fingerprint == fp
-                && !old.stale
+                && !unkept
+                && let Some(old) = self.results.get(i).filter(current)
             {
                 if !old.skipped {
                     state = old.state.clone();
@@ -1804,7 +1811,7 @@ impl Model {
                 out.push(old.clone());
                 continue;
             }
-            reuse = false;
+            reuse = unkept && !cancelled;
             if f.suppressed || rolled_back || cancelled {
                 out.push(FeatureResult {
                     id: f.id,
@@ -1816,6 +1823,7 @@ impl Model {
                     skipped: true,
                     stale: false,
                     fingerprint: fp,
+                    unkept: false,
                     state: state.clone(),
                 });
                 continue;
@@ -1833,6 +1841,8 @@ impl Model {
                 if c.error.is_none() {
                     state = c.state.clone();
                 }
+                // A kept result after a failed one would not be this evaluation's.
+                reuse &= c.error.is_none();
                 out.push(FeatureResult {
                     id: f.id,
                     name: f.name.clone(),
@@ -1843,6 +1853,7 @@ impl Model {
                     skipped: false,
                     stale: false,
                     fingerprint: fp,
+                    unkept: false,
                     state: state.clone(),
                 });
                 continue;
@@ -1853,7 +1864,8 @@ impl Model {
                 if r.error.is_none() {
                     state = r.state.clone();
                 }
-                out.push(FeatureResult { state: state.clone(), ..r.clone() });
+                reuse &= r.error.is_none();
+                out.push(FeatureResult { state: state.clone(), unkept: false, ..r.clone() });
                 continue;
             }
             recomputed += 1;
@@ -1985,6 +1997,7 @@ impl Model {
                     m.put(key, e);
                 }
             }
+            reuse &= error.is_none();
             out.push(FeatureResult {
                 id: f.id,
                 name: f.name.clone(),
@@ -1995,6 +2008,7 @@ impl Model {
                 skipped: false,
                 stale: false,
                 fingerprint: fp,
+                unkept: false,
                 state: state.clone(),
             });
         }
