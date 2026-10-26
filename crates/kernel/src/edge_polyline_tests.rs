@@ -157,3 +157,73 @@ fn circle_divides_as_before() {
         }
     }
 }
+
+/// A line whose samples are off it by far more than the tolerance, differently at every
+/// parameter: what an intersection of surfaces that all but coincide gives, whose projected
+/// points never settle however fine the division.
+#[derive(Clone)]
+struct Unsettled {
+    calls: Arc<AtomicUsize>,
+    cap: usize,
+}
+
+impl Unsettled {
+    fn at(&self, t: f64) -> Point3 {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let h = (t.to_bits().wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11) as f64 / (1u64 << 53) as f64;
+        Point3::new(100.0 * t, (h - 0.5) * 0.5, 0.0)
+    }
+}
+
+impl ParametricCurve for Unsettled {
+    type Point = Point3;
+    type Vector = Vector3;
+    fn subs(&self, t: f64) -> Point3 {
+        self.at(t)
+    }
+    fn der(&self, _: f64) -> Vector3 {
+        Vector3::new(100.0, 0.0, 0.0)
+    }
+    fn der2(&self, _: f64) -> Vector3 {
+        Vector3::new(0.0, 0.0, 0.0)
+    }
+    fn parameter_range(&self) -> ParameterRange {
+        (std::ops::Bound::Included(0.0), std::ops::Bound::Included(1.0))
+    }
+}
+
+impl BoundedCurve for Unsettled {}
+
+impl TrySubs for Unsettled {
+    fn max_polyline_points(&self) -> usize {
+        self.cap
+    }
+}
+
+impl ParameterDivision1D for Unsettled {
+    type Point = Point3;
+    fn parameter_division(&self, range: (f64, f64), _: f64) -> (Vec<f64>, Vec<Point3>) {
+        (vec![range.0, range.1], vec![self.subs(range.0), self.subs(range.1)])
+    }
+}
+
+/// A curve whose samples never settle to the tolerance stops at the curve's cap, with the cap's
+/// points spread over the whole curve, and after a number of samples that follows from the cap.
+/// Dividing the first half first spent the points on the start of the curve (17 000 of them on
+/// 8 % of it, at 0.7 ms a sample on an intersection of NURBS cylinders, in a pattern of lugs round
+/// a filleted bore) and left the rest as chords of half the curve.
+#[test]
+fn a_division_that_never_settles_stops_at_the_cap_and_covers_the_whole_curve() {
+    for cap in [64, 500, 1_000] {
+        let curve = Unsettled { calls: Arc::default(), cap };
+        let points = bounded_polyline(&curve, (0.0, 1.0), Deflection::chord(0.01)).0;
+        assert!(points.len() <= cap + 1 && points.len() > cap / 4, "{} points for a cap of {cap}", points.len());
+        assert_eq!((points[0].x, points[points.len() - 1].x), (0.0, 100.0));
+        let gaps: Vec<f64> = points.windows(2).map(|w| w[1].x - w[0].x).collect();
+        let (shortest, longest) = gaps.iter().fold((f64::MAX, 0.0f64), |(lo, hi), g| (lo.min(*g), hi.max(*g)));
+        assert!(shortest > 0.0 && longest / shortest < 1.0 + 1e-9, "pieces from {shortest} to {longest} long for a cap of {cap}");
+        // Two samples for each piece judged, and the pieces of all the levels sum to twice the last.
+        let calls = curve.calls.load(Ordering::Relaxed);
+        assert!(calls <= 4 * cap + 2, "{calls} samples for a cap of {cap}");
+    }
+}

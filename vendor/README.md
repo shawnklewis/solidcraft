@@ -68,6 +68,16 @@ Changes:
   farther from the leader's point than the curve's tolerance (the projection settled on another
   part of a surface, such as the far side of a small hole) is dropped for the search from
   nothing, as before. `crates/kernel/src/issue_1038_tests.rs` holds it to that search.
+- `decorators/intersection_curve.rs`: that division is bounded (hostile or ill-conditioned
+  geometry must not hang). A piece whose midpoint never comes within the tolerance of its chord
+  (the intersection of two surfaces that all but coincide, whose projections jump between the
+  surfaces' parts) was halved in both halves again at every level, down to 100 levels, so the
+  steps grew as 2^100: a pattern of lugs round a filleted bore ran for minutes. The depth is now
+  at most 40 (about 1e-12 of the curve's span), a range that cannot be halved any more (its ends
+  are neighbouring numbers) is a piece, and one division takes at most 1 024 steps over the whole
+  curve; where they run out, a piece is kept as it stands.
+  `crates/kernel/src/intersection_curve_tests.rs` (`lugs_round_a_filleted_bore`) holds it to the
+  pattern.
 - `decorators/revolved_curve.rs`: a point on a revolved surface's seam (angle 0, the same place
   as 2π) takes the end of the period nearer the hinted angle. The angle was decided by the sign of
   a cross product that is rounding noise there, so a boundary followed point by point could come
@@ -172,7 +182,8 @@ Changes:
   thousands of parameter units, and meshing that grid never finishes); the last-resort nearest
   search is clamped into the domain.
 - `tessellation/triangulation.rs`, bounded work (hostile files must not hang): edge polylines
-  and surface grids come from our own bounded divisions (at most 20 000 points per edge, a
+  and surface grids come from our own bounded divisions (at most 20 000 points per edge, 1 000 for
+  an intersection curve, a
   grid budget per face shared out of 10 million points per shell, 24 refinement rounds; a
   point that does not evaluate counts as flat instead of recursing). Surface grids refine only
   the direction that bends, and a ruling left undivided gets cells comparable to the other
@@ -182,6 +193,16 @@ Changes:
   piece instead of 4, and the same polyline (a point of an intersection curve costs two grid
   searches of its surfaces). `bounded_polyline` and `Deflection::turn2`/`turns` are public but
   hidden, for the kernel's regression against the old division.
+- `tessellation/triangulation.rs`, `tessellation/mod.rs`: an edge's division halves its pieces a
+  level at a time instead of one half after the other, and the cap on its points belongs to the
+  curve (`TrySubs::max_polyline_points`): 20 000 as before, 1 000 for an intersection curve. Each
+  point of an intersection curve is two searches over free-form surfaces (about 0.7 ms), and where
+  the surfaces all but coincide the projected points never settle to the chord tolerance at any
+  scale, so every piece asks to be halved until the cap: 17 000 points on 8 % of an edge, the rest
+  left as chords of half the curve, minutes for the edges of one boolean. Below the cap the points
+  and the evaluations are those of the old order (`edge_polyline_tests.rs` holds them to it, bit
+  for bit); at the cap the points are spread over the whole curve
+  (`a_division_that_never_settles_stops_at_the_cap_and_covers_the_whole_curve`).
 - `tessellation/mod.rs`, `tessellation/triangulation.rs`, for display: a `Deflection` is the
   chord tolerance plus an optional bound on the angle one facet spans, and
   `RoundMeshableShape::robust_triangulation_within` divides by it: an edge or a grid direction

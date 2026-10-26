@@ -1286,20 +1286,27 @@ fn add_grid_constraints(triangulation: &mut Cdt, insert_res: &[Vec<Option<Vertex
 pub(super) const MAX_GRID: usize = 150_000;
 /// SolidCraft: grid points shared by all faces of one shell; many faces get fewer each.
 pub(super) const SHELL_GRID_BUDGET: usize = 10_000_000;
-/// SolidCraft: most points on one edge's polyline.
-const MAX_EDGE_POINTS: usize = 20_000;
+/// SolidCraft: most points on one edge's polyline (a curve that costs more to sample asks for
+/// fewer: `TrySubs::max_polyline_points`).
+pub(super) const MAX_EDGE_POINTS: usize = 20_000;
 
 /// SolidCraft: the grid budget of each face of a shell with `faces` faces.
 pub(super) fn face_cap(faces: usize) -> usize {
     (SHELL_GRID_BUDGET / faces.max(1)).clamp(2_000, MAX_GRID)
 }
 
-/// SolidCraft: truck's curve division, bounded: at most `MAX_EDGE_POINTS` points and a
-/// bisection depth of 24; a midpoint that does not evaluate (NaN) counts as flat (truck's
+/// SolidCraft: truck's curve division, bounded: at most `TrySubs::max_polyline_points` points
+/// and a bisection depth of 24; a midpoint that does not evaluate (NaN) counts as flat (truck's
 /// version recursed on it 100 levels deep, which never finishes). A piece within the chord
 /// tolerance is still halved while it turns more than the deflection's angle.
+///
+/// The pieces are halved a level at a time, so where the cap stops the division the whole curve is
+/// as fine as the points allow. (Going down one half first spent the points on the start of a
+/// curve whose samples never settle, an intersection of surfaces that all but coincide, and left
+/// the rest as a few long chords.) Below the cap the points are the same as that order gives.
 pub(super) fn bounded_polyline<C: PolylineableCurve>(curve: &C, range: (f64, f64), d: Deflection) -> PolylineCurve {
     let (tol, turn2) = (d.chord, d.turn2());
+    let cap = curve.max_polyline_points();
     // A sample that does not evaluate (an intersection curve whose projection fails): an interval
     // end falls back to the curve's approximation so the polyline stays finite; an interior probe
     // is NaN, which counts as flat. Each parameter is evaluated once: a piece carries the points
@@ -1308,26 +1315,48 @@ pub(super) fn bounded_polyline<C: PolylineableCurve>(curve: &C, range: (f64, f64
     let end = |t: f64| curve.try_subs(t).unwrap_or_else(|| curve.approx_subs(t));
     let nan = Point3::new(f64::NAN, f64::NAN, f64::NAN);
     let (p0, p1) = (end(range.0), end(range.1));
-    let mut out = vec![p0];
-    let mut stack: Vec<(f64, f64, Point3, Point3, usize)> = vec![(range.0, range.1, p0, p1, 0)];
-    while let Some((a, b, pa, pb, depth)) = stack.pop() {
-        let t = a + (b - a) * 0.4729;
-        let chord = pa + (pb - pa) * 0.4729;
-        let d2 = curve.try_subs(t).unwrap_or(nan).distance2(chord);
-        let tm = 0.5 * (a + b);
-        let sm = curve.try_subs(tm);
-        let dm = sm.unwrap_or(nan).distance2(pa.midpoint(pb));
-        let flat = !(d2 >= tol * tol || dm >= tol * tol);
-        let flat = flat && !d.turns(turn2, d2.max(dm), pa.distance2(pb));
-        if flat || depth >= 24 || out.len() + stack.len() >= MAX_EDGE_POINTS {
-            out.push(pb);
-        } else {
-            let pm = sm.unwrap_or_else(|| curve.approx_subs(tm));
-            // Right half after the left one (stack order).
-            stack.push((tm, b, pm, pb, depth + 1));
-            stack.push((a, tm, pa, pm, depth + 1));
+    // The finished pieces: where each starts and the point it ends at.
+    let mut done: Vec<(f64, Point3)> = Vec::new();
+    let mut level: Vec<(f64, f64, Point3, Point3)> = vec![(range.0, range.1, p0, p1)];
+    for depth in 0..=24 {
+        if level.is_empty() {
+            break;
         }
+        // Each piece of the level: `None` where it is flat, else its midpoint.
+        let judged: Vec<Option<Point3>> = level
+            .iter()
+            .map(|&(a, b, pa, pb)| {
+                let t = a + (b - a) * 0.4729;
+                let chord = pa + (pb - pa) * 0.4729;
+                let d2 = curve.try_subs(t).unwrap_or(nan).distance2(chord);
+                let tm = 0.5 * (a + b);
+                let sm = curve.try_subs(tm);
+                let dm = sm.unwrap_or(nan).distance2(pa.midpoint(pb));
+                let flat = !(d2 >= tol * tol || dm >= tol * tol);
+                let flat = flat && !d.turns(turn2, d2.max(dm), pa.distance2(pb));
+                (!flat).then(|| sm.unwrap_or_else(|| curve.approx_subs(tm)))
+            })
+            .collect();
+        let splits = judged.iter().flatten().count();
+        // Halving every piece that asks for it takes this many points.
+        let room = depth < 24 && done.len() + level.len() + splits <= cap;
+        let mut next = Vec::with_capacity(2 * splits);
+        for (&(a, b, pa, pb), pm) in level.iter().zip(judged) {
+            match pm {
+                Some(pm) if room => {
+                    let tm = 0.5 * (a + b);
+                    next.push((a, tm, pa, pm));
+                    next.push((tm, b, pm, pb));
+                }
+                _ => done.push((a, pb)),
+            }
+        }
+        level = next;
     }
+    done.sort_by(|x, y| (x.0 - range.0).abs().total_cmp(&(y.0 - range.0).abs()));
+    let mut out = Vec::with_capacity(done.len() + 1);
+    out.push(p0);
+    out.extend(done.into_iter().map(|(_, p)| p));
     PolylineCurve(out)
 }
 

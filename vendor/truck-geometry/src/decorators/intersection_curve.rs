@@ -175,9 +175,24 @@ where
         let tol = if tol >= TOLERANCE { tol } else { TOLERANCE };
         let start = self.hinted_triple(range.0, None);
         let end = self.hinted_triple(range.1, None);
-        hinted_sub_division(self, range, (start, end), tol, 100)
+        let mut steps = MAX_DIVISION_STEPS;
+        hinted_sub_division(self, range, (start, end), tol, MAX_DIVISION_DEPTH, &mut steps)
     }
 }
+
+// SolidCraft: the deepest bisection. Halving a range 40 times narrows it to about 1e-12 of the
+// curve's parameter span, past what a point's projection onto the surfaces can tell apart; the
+// 100 levels the upstream division allowed only multiplied the steps taken where the curve
+// never came within the tolerance.
+const MAX_DIVISION_DEPTH: usize = 40;
+
+// SolidCraft: the most bisection steps one `parameter_division` takes. A curve that cannot be
+// brought within the tolerance (the intersection of two all-but-coincident surfaces, whose
+// projections jump between the surfaces' parts: a pin's wall on a hole's, once a fillet has
+// turned the hole into a free-form surface) is split in both halves again at every level, so
+// the steps grew as 2^trials: a pattern of lugs round a bore ran for minutes. The steps are
+// counted over the whole curve; where they run out, a piece is kept as it stands.
+const MAX_DIVISION_STEPS: usize = 1024;
 
 // SolidCraft: a point of the curve with its parameters on both surfaces.
 type Triple = (Point3, Point2, Point2);
@@ -240,12 +255,19 @@ fn hinted_sub_division<C, S>(
     ends: (Triple, Triple),
     tol: f64,
     trials: usize,
+    steps: &mut usize,
 ) -> (Vec<f64>, Vec<Point3>)
 where
     C: ParametricCurve3D,
     S: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
 {
     let (p0, p1) = (ends.0 .0, ends.1 .0);
+    // A range that cannot be halved any more (its ends are neighbouring numbers) is a piece.
+    let halves = (range.0 + range.1) / 2.0;
+    if *steps == 0 || !(range.0 < halves && halves < range.1) {
+        return (vec![range.0, range.1], vec![p0, p1]);
+    }
+    *steps -= 1;
     let gen = p0.midpoint(p1);
     let p = 0.5 + (0.2 * HashGen::hash1(gen) - 0.1);
     let t = range.0 * (1.0 - p) + range.1 * p;
@@ -259,10 +281,10 @@ where
         let mid_param = (range.0 + range.1) / 2.0;
         let mid_value = curve.hinted_triple(mid_param, Some(ends.0));
         let (mut params, mut pts) =
-            hinted_sub_division(curve, (range.0, mid_param), (ends.0, mid_value), tol, trials - 1);
+            hinted_sub_division(curve, (range.0, mid_param), (ends.0, mid_value), tol, trials - 1, steps);
         let _ = (params.pop(), pts.pop());
         let (new_params, new_pts) =
-            hinted_sub_division(curve, (mid_param, range.1), (mid_value, ends.1), tol, trials - 1);
+            hinted_sub_division(curve, (mid_param, range.1), (mid_value, ends.1), tol, trials - 1, steps);
         params.extend(new_params);
         pts.extend(new_pts);
         (params, pts)
